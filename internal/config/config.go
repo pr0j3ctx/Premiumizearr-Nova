@@ -47,7 +47,10 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 
 	if config.EnableArrSubfolders {
 		if err := ValidateArrs(config.Arrs); err != nil {
-			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml (or in the web UI) and restart, or set EnableArrSubfolders back to false.", err)
+			// This failure happens before any service starts (app.Start
+			// panics on it), so the web UI is unreachable - only point at
+			// paths that work from here.
+			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml and restart, or set EnableArrSubfolders back to false.", err)
 			return config, ErrInvalidArrConfig
 		}
 	}

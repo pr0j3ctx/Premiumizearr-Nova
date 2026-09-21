@@ -160,8 +160,15 @@
   }
 
   function AddArr() {
+    // Skip names already in use: the length+1 counter can collide after
+    // a row deletion (e.g. rows [1,2] -> delete 1 -> next is "new-arr-2").
+    const used = new Set(config.Arrs.map((a) => a.Name));
+    let n = config.Arrs.length + 1;
+    while (used.has(`new-arr-${n}`)) {
+      n++;
+    }
     config.Arrs.push({
-      Name: `new-arr-${config.Arrs.length + 1}`,
+      Name: `new-arr-${n}`,
       URL: "http://127.0.0.1:1234",
       APIKey: "xxxxxxxx",
       Type: "Sonarr",
@@ -263,11 +270,12 @@
                 bind:value={arr.Name}
                 disabled={inputDisabled}
                 on:input={() => {
-                  arr.Name = slugify(arr.Name);
                   UntestArr(i);
                 }}
                 on:blur={() => {
-                  arr.Name = trimSlugEdges(arr.Name);
+                  // Normalize on blur, not on input: rewriting the bound
+                  // value while typing moves the caret.
+                  arr.Name = trimSlugEdges(slugify(arr.Name));
                 }}
               />
               <TextInput

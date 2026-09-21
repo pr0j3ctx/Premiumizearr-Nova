@@ -3,7 +3,7 @@ package service
 import (
 	"encoding/json"
 	"net/http"
-	"path"
+	"path/filepath"
 	"sort"
 
 	"github.com/ensingerphilipp/premiumizearr-nova/internal/config"
@@ -96,10 +96,13 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 		resp.Status = "Not Initialized"
 	} else {
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
-			name := path.Base(n)
+			// filepath (not path): fsnotify event names carry the platform
+			// separator (backslashes on Windows), and Clean/Dir/Base
+			// normalize both styles on both platforms.
+			name := filepath.Base(n)
 			arr := ""
-			if path.Dir(n) != path.Clean(s.config.BlackholeDirectory) {
-				arr = path.Base(path.Dir(n))
+			if filepath.Dir(n) != filepath.Clean(s.config.BlackholeDirectory) {
+				arr = filepath.Base(filepath.Dir(n))
 			}
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,

@@ -37,6 +37,7 @@ type pmeStub struct {
 	nextID          int
 	transferTargets []string
 	createdFolders  []string
+	transfers       []premiumizeme.Transfer
 }
 
 func newPmeStub(t *testing.T, failAll bool) *pmeStub {
@@ -83,6 +84,8 @@ func (s *pmeStub) handle(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseMultipartForm(1 << 20)
 		s.transferTargets = append(s.transferTargets, r.FormValue("folder_id"))
 		_, _ = w.Write([]byte(`{"status":"success","id":"transfer-1"}`))
+	case r.URL.Path == "/api/transfer/list":
+		writeJSON(w, map[string]any{"status": "success", "transfers": s.transfers})
 	case r.URL.Path == "/api/folder/paste":
 		_, _ = w.Write([]byte(`{"status":"success"}`))
 	case r.URL.Path == "/api/folder/delete":
@@ -121,6 +124,20 @@ func assertNoCallWithin(t *testing.T, s *pmeStub, timeout time.Duration, what st
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// waitForCall fails if no matching call is observed within timeout; unlike
+// assertNoCallWithin it succeeds on the first observation.
+func waitForCall(t *testing.T, s *pmeStub, timeout time.Duration, what string, pred func(pmeCall) bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if s.anyCall(pred) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("%s; calls = %v", what, s.calls)
 }
 
 func newPmeTestClient(t *testing.T, s *pmeStub) *premiumizeme.Premiumizeme {
@@ -574,7 +591,7 @@ func TestCheckFolderSkipsOnlyFolderItemsNamedLikeSlugs(t *testing.T) {
 		DownloadSpeedLimit:    100,
 	}, map[string]string{"sonarr": "arr-folder-id"})
 
-	if !m.checkFolder("main-id", m.config.DownloadsDirectory, map[string]bool{"sonarr": true}) {
+	if !m.checkFolder("main-id", m.config.DownloadsDirectory, map[string]bool{"sonarr": true}, nil) {
 		t.Fatalf("checkFolder returned false, want true (cap not reached)")
 	}
 
@@ -670,4 +687,163 @@ func TestCheckFileReestablishesWatchOnRecreatedSubfolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForQueuedPath(t, dw.Queue, episode, 5*time.Second)
+}
+
+// TestManagerKeepsTransferDestinationFoldersAcrossRestart is the regression
+// test for finding R1-5 (complete): after a daemon restart the arrFolders
+// map is empty, so a renamed-away or stale Arr routing folder in the pme
+// downloads root can no longer be recognized by name. The identity layer
+// closes that gap: the transfer/list endpoint names the destination folder
+// of every non-error transfer, so a root-level folder whose own ID is a
+// transfer destination is kept, never downloaded and deleted, regardless
+// of its current name.
+func TestManagerKeepsTransferDestinationFoldersAcrossRestart(t *testing.T) {
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "old-sonarr-id", Name: "sonarr", Type: "folder"}, // stale Arr routing folder (renamed away)
+		{ID: "show-id", Name: "Show.S01", Type: "folder"},     // transferred content
+	}
+	stub.table["show-id"] = []premiumizeme.Item{}
+	stub.transfers = []premiumizeme.Transfer{
+		{ID: "t1", Name: "sonarr feed", Status: "finished", FolderID: "old-sonarr-id"},
+		{ID: "t2", Name: "show feed", Status: "finished", FolderID: "main-id"},
+	}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   true,
+		Arrs:                  []config.ArrConfig{{Name: "sonarr-2", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, map[string]string{}) // fresh process: nothing resolved yet
+
+	// Simulate Run()'s TaskUpdateTransfersList having populated the cache
+	// in the same goroutine before this task ran.
+	m.transfers = append([]premiumizeme.Transfer(nil), stub.transfers...)
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// The stale routing folder (name no longer matches any configured Arr)
+	// must be kept by the identity layer: no listing, no deletion.
+	assertNoCallWithin(t, stub, time.Second, "transfer-destination folder was handed to the download path", func(c pmeCall) bool {
+		return c.Query["id"] == "old-sonarr-id" && (c.Path == "/api/folder/list" || c.Path == "/api/folder/delete")
+	})
+
+	// Regular transferred content is unaffected and still processed end to
+	// end: listed, downloaded (empty here) and deleted.
+	waitForCall(t, stub, 5*time.Second, "transferred content folder was not deleted", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "show-id"
+	})
+}
+
+// TestManagerTransferDestinationsIgnoredWhenFeatureOff proves the identity
+// layer is gated on EnableArrSubfolders: with the feature off, a folder
+// that is a transfer destination is still processed (downloaded and
+// deleted), exactly like before the per-Arr subfolders feature existed.
+func TestManagerTransferDestinationsIgnoredWhenFeatureOff(t *testing.T) {
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{{ID: "dest-id", Name: "anything", Type: "folder"}}
+	stub.table["dest-id"] = []premiumizeme.Item{}
+	stub.transfers = []premiumizeme.Transfer{{ID: "t1", Name: "feed", Status: "finished", FolderID: "dest-id"}}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   false,
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, nil)
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// Feature off: the destination folder is ordinary content and must be
+	// downloaded and deleted.
+	waitForCall(t, stub, 5*time.Second, "transfer-destination folder was not processed with the feature off", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "dest-id"
+	})
+}
+
+// TestDownloadDedupScopedByFolderID is the unit regression test for
+// finding R1-8: download and cooldown tracking is keyed by premiumize.me
+// folder ID plus item name, so same-named items admitted from different
+// folders never block, overwrite, or shadow each other.
+func TestDownloadDedupScopedByFolderID(t *testing.T) {
+	m := TransferManagerService{}.New()
+
+	m.addDownload(&premiumizeme.Item{Name: "Show"}, "f1", true)
+	m.addDownload(&premiumizeme.Item{Name: "Show"}, "f2", true)
+	if got := m.countDownloads(); got != 2 {
+		t.Fatalf("two same-named jobs from different folders: countDownloads() = %d, want 2", got)
+	}
+	if !m.downloadExists("f1", "Show") || !m.downloadExists("f2", "Show") {
+		t.Fatal("downloadExists = false for a folder+name pair that was admitted")
+	}
+	if m.downloadExists("f3", "Show") {
+		t.Fatal("downloadExists = true for a folder that never admitted the item")
+	}
+
+	// Removing one job leaves the same-named job in the other folder.
+	m.removeDownload("f1", "Show")
+	if got := m.countDownloads(); got != 1 {
+		t.Fatalf("after removing one job: countDownloads() = %d, want 1", got)
+	}
+	if !m.downloadExists("f2", "Show") {
+		t.Fatal("removing one job leaked into the same-named job in another folder")
+	}
+
+	// Cooldown is scoped the same way: a failure in f1 keeps the
+	// same-named item in f2 retryable.
+	m.markDownloadFailed("f1", "Show")
+	if !m.isDownloadInCooldown("f1", "Show") {
+		t.Fatal("isDownloadInCooldown = false right after markDownloadFailed")
+	}
+	if m.isDownloadInCooldown("f2", "Show") {
+		t.Fatal("failure in one folder put a same-named item in another folder into cooldown")
+	}
+}
+
+// TestCheckFolderSameNameInDifferentArrFolders is the integration
+// regression test for finding R1-8: two Arr subfolders that each contain
+// a folder with the same name must both be admitted and fully processed -
+// with bare-name keying the second admission is skipped and its folder is
+// never listed or deleted.
+func TestCheckFolderSameNameInDifferentArrFolders(t *testing.T) {
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "sonarr-id", Name: "sonarr", Type: "folder"},
+		{ID: "radarr-id", Name: "radarr", Type: "folder"},
+	}
+	stub.table["sonarr-id"] = []premiumizeme.Item{{ID: "show-sonarr-id", Name: "Show", Type: "folder"}}
+	stub.table["radarr-id"] = []premiumizeme.Item{{ID: "show-radarr-id", Name: "Show", Type: "folder"}}
+	stub.table["show-sonarr-id"] = []premiumizeme.Item{}
+	stub.table["show-radarr-id"] = []premiumizeme.Item{}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders: true,
+		Arrs: []config.ArrConfig{
+			{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr},
+			{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "k", Type: config.Radarr},
+		},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, map[string]string{"sonarr": "sonarr-id", "radarr": "radarr-id"})
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	for _, id := range []string{"show-sonarr-id", "show-radarr-id"} {
+		waitForCall(t, stub, 5*time.Second, "same-named folder in an Arr subfolder was not fully processed", func(id string) func(pmeCall) bool {
+			return func(c pmeCall) bool {
+				return c.Path == "/api/folder/delete" && c.Query["id"] == id
+			}
+		}(id))
+	}
 }

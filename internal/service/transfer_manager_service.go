@@ -21,9 +21,21 @@ type DownloadDetails struct {
 	Added              time.Time
 	Name               string
 	ProgressDownloader *progress_downloader.WriteCounter
+	// FolderID is the premiumize.me folder the item was admitted from.
+	// It scopes download/cooldown dedup: same-named items in different
+	// folders are independent jobs and must not block, overwrite, or
+	// cause premature folder deletion of each other.
+	FolderID string
 	// topLevel marks entries for top-level folder jobs admitted by
 	// HandleFinishedItem; only these count against SimultaneousDownloads.
 	topLevel bool
+}
+
+// downloadKey is the composite key for downloadList and failedDownloads:
+// the premiumize.me folder ID an item was admitted from, plus the item
+// name. The NUL separator keeps keys unique for any folder ID and name.
+func downloadKey(folderID, name string) string {
+	return folderID + "\x00" + name
 }
 
 // erroredTransferState tracks one errored premiumize.me transfer during the
@@ -610,6 +622,7 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 	}
 
 	var arrFolders map[string]string
+	var transferDestinations map[string]bool
 	if manager.config.EnableArrSubfolders {
 		manager.arrFoldersMutex.Lock()
 		arrFolders = make(map[string]string, len(manager.arrFolders))
@@ -617,6 +630,25 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 			arrFolders[slug] = folderID
 		}
 		manager.arrFoldersMutex.Unlock()
+
+		// Identity layer: the transfer/list endpoint reports, for every
+		// non-error transfer, the destination folder (folder_id) it was
+		// placed into once finished. A folder whose own ID appears here is
+		// therefore a client-managed routing folder - including old or
+		// renamed Arr subfolders whose slug no longer matches the
+		// configured Arr names, where the name-based excludeNames layer
+		// can no longer recognize them. Such folders are kept, never
+		// downloaded and deleted. manager.transfers is the last successful
+		// fetch: Run() runs TaskUpdateTransfersList and this task
+		// sequentially in one goroutine. If the list endpoint has never
+		// succeeded the set is empty and the name-based layers below are
+		// the remaining protection.
+		transferDestinations = make(map[string]bool)
+		for _, t := range manager.transfers {
+			if t.FolderID != "" && t.Status != "error" {
+				transferDestinations[t.FolderID] = true
+			}
+		}
 	}
 
 	excludeNames := make(map[string]bool, len(arrFolders))
@@ -624,7 +656,7 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 		excludeNames[slug] = true
 	}
 
-	if !manager.checkFolder(manager.downloadsFolderID, manager.config.DownloadsDirectory, excludeNames) {
+	if !manager.checkFolder(manager.downloadsFolderID, manager.config.DownloadsDirectory, excludeNames, transferDestinations) {
 		return
 	}
 
@@ -635,13 +667,13 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 			continue
 		}
 		localDir := filepath.Join(manager.config.DownloadsDirectory, slug)
-		if !manager.checkFolder(folderID, localDir, nil) {
+		if !manager.checkFolder(folderID, localDir, nil, transferDestinations) {
 			return // SimultaneousDownloads cap reached
 		}
 	}
 }
 
-func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir string, excludeNames map[string]bool) bool {
+func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir string, excludeNames, transferDestinations map[string]bool) bool {
 	items, err := manager.premiumizemeClient.ListFolder(premiumizeFolderID)
 	if err != nil {
 		log.Errorf("Error listing downloads folder: %s", err.Error())
@@ -656,14 +688,26 @@ func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir 
 			continue
 		}
 
+		// Identity layer: a folder that is the destination (folder_id) of a
+		// non-error transfer is a client-managed routing folder - e.g. an
+		// old or renamed Arr subfolder whose slug no longer matches a
+		// configured Arr name. Keep it; downloading and deleting it would
+		// destroy tracked routing state. Transferred content folders are
+		// unaffected: their folder_id is the parent they were placed into,
+		// not their own ID.
+		if item.Type == "folder" && transferDestinations[item.ID] {
+			log.Debugf("Keeping folder %s (id %s): it is the destination of a transfer, not transfer content", item.Name, item.ID)
+			continue
+		}
+
 		// Skip items that are currently downloading
-		if manager.downloadExists(item.Name) {
+		if manager.downloadExists(premiumizeFolderID, item.Name) {
 			log.Tracef("Item %s is already downloading", item.Name)
 			continue
 		}
 
 		// Skip items in cooldown period after failed download
-		if manager.isDownloadInCooldown(item.Name) {
+		if manager.isDownloadInCooldown(premiumizeFolderID, item.Name) {
 			log.Debugf("Skipping item %s - in cooldown period after previous failure", item.Name)
 			continue
 		}
@@ -684,13 +728,14 @@ func (manager *TransferManagerService) updateTransfers(transfers []premiumizeme.
 	manager.transfers = transfers
 }
 
-func (manager *TransferManagerService) addDownload(item *premiumizeme.Item, topLevel bool) {
+func (manager *TransferManagerService) addDownload(item *premiumizeme.Item, folderID string, topLevel bool) {
 	manager.downloadListMutex.Lock()
 	defer manager.downloadListMutex.Unlock()
 
-	manager.downloadList[item.Name] = &DownloadDetails{
+	manager.downloadList[downloadKey(folderID, item.Name)] = &DownloadDetails{
 		Added:              time.Now(),
 		Name:               item.Name,
+		FolderID:           folderID,
 		ProgressDownloader: progress_downloader.NewWriteCounter(),
 		topLevel:           topLevel,
 	}
@@ -711,19 +756,19 @@ func (manager *TransferManagerService) countDownloads() int {
 	return count
 }
 
-func (manager *TransferManagerService) removeDownload(name string) {
+func (manager *TransferManagerService) removeDownload(folderID, name string) {
 	manager.downloadListMutex.Lock()
 	defer manager.downloadListMutex.Unlock()
 
-	delete(manager.downloadList, name)
+	delete(manager.downloadList, downloadKey(folderID, name))
 }
 
-func (manager *TransferManagerService) downloadExists(itemName string) bool {
+func (manager *TransferManagerService) downloadExists(folderID, itemName string) bool {
 	manager.downloadListMutex.Lock()
 	defer manager.downloadListMutex.Unlock()
 
 	for _, dl := range manager.downloadList {
-		if dl.Name == itemName {
+		if dl.FolderID == folderID && dl.Name == itemName {
 			return true
 		}
 	}
@@ -731,31 +776,31 @@ func (manager *TransferManagerService) downloadExists(itemName string) bool {
 	return false
 }
 
-func (manager *TransferManagerService) markDownloadFailed(itemName string) {
+func (manager *TransferManagerService) markDownloadFailed(folderID, itemName string) {
 	manager.failedDownloadsMutex.Lock()
 	defer manager.failedDownloadsMutex.Unlock()
-	manager.failedDownloads[itemName] = time.Now()
+	manager.failedDownloads[downloadKey(folderID, itemName)] = time.Now()
 	log.Warnf("Marked %s as failed, will retry after cooldown period", itemName)
 }
 
-func (manager *TransferManagerService) isDownloadInCooldown(itemName string) bool {
+func (manager *TransferManagerService) isDownloadInCooldown(folderID, itemName string) bool {
 	manager.failedDownloadsMutex.Lock()
 	defer manager.failedDownloadsMutex.Unlock()
 
-	if failureTime, exists := manager.failedDownloads[itemName]; exists {
+	if failureTime, exists := manager.failedDownloads[downloadKey(folderID, itemName)]; exists {
 		// 30 minute cooldown period before retrying
 		if time.Since(failureTime) < 30*time.Minute {
 			log.Tracef("Item %s is in cooldown period (failed at %v)", itemName, failureTime)
 			return true
 		}
 		// Cooldown expired, remove from failed list
-		delete(manager.failedDownloads, itemName)
+		delete(manager.failedDownloads, downloadKey(folderID, itemName))
 	}
 	return false
 }
 
 func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item, downloadDirectory string, premiumizeParentFolderID string) {
-	if manager.downloadExists(item.Name) {
+	if manager.downloadExists(premiumizeParentFolderID, item.Name) {
 		log.Tracef("Transfer %s is already downloading", item.Name)
 		return
 	}
@@ -786,14 +831,14 @@ func (manager *TransferManagerService) HandleFinishedItem(item premiumizeme.Item
 		return
 	}
 
-	manager.addDownload(&item, true)
+	manager.addDownload(&item, premiumizeParentFolderID, true)
 	go func() {
-		defer manager.removeDownload(item.Name)
+		defer manager.removeDownload(premiumizeParentFolderID, item.Name)
 		err := manager.downloadFolderRecursively(item, downloadDirectory)
 		if err != nil {
 			log.Errorf("Error downloading item %s: %s", item.Name, err)
 			// Mark parent folder as failed so it respects cooldown and doesn't block queue
-			manager.markDownloadFailed(item.Name)
+			manager.markDownloadFailed(premiumizeParentFolderID, item.Name)
 			return
 		}
 
@@ -823,51 +868,60 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 	err = os.MkdirAll(savePath, os.ModePerm)
 	if err != nil {
 		log.Errorf("could not create save path: %s", err)
-		//		manager.removeDownload(item.Name)
+		//		manager.removeDownload(item.ID, item.Name)
 		//		return fmt.Errorf("error creating save path: %w", err)
 		//		no return due to os permissions sometime inaccurately throwing errors on different configurations
 	}
 
 	var folderHasErrors bool = false
 	var parentItemName = item.Name // Store parent folder name before loop to avoid variable shadowing
-	for _, item := range items {
-		if manager.downloadExists(item.Name) {
-			log.Tracef("Transfer %s is already downloading", item.Name)
+	// parentFolderID scopes child download/cooldown dedup to this folder:
+	// same-named children in different folders are independent jobs.
+	parentFolderID := item.ID
+	for _, child := range items {
+		if manager.downloadExists(parentFolderID, child.Name) {
+			log.Tracef("Transfer %s is already downloading", child.Name)
 			continue
 		}
 
 		// Check cooldown for any item (file or folder) that previously failed
-		if manager.isDownloadInCooldown(item.Name) {
-			log.Debugf("Skipping item %s - in cooldown period after previous failure", item.Name)
+		if manager.isDownloadInCooldown(parentFolderID, child.Name) {
+			log.Debugf("Skipping item %s - in cooldown period after previous failure", child.Name)
 			folderHasErrors = true // Still mark as error to prevent folder deletion
 			continue
 		}
 
-		if item.Type == "file" {
-			manager.addDownload(&item, false)
-			link, err := manager.premiumizemeClient.GenerateFileLink(item.ID)
+		if child.Type == "file" {
+			manager.addDownload(&child, parentFolderID, false)
+			link, err := manager.premiumizemeClient.GenerateFileLink(child.ID)
 			if err != nil {
 				log.Debugf("File Link Generation err: %s", err)
 			}
-			var fileSavePath = path.Join(savePath, item.Name)
+			var fileSavePath = path.Join(savePath, child.Name)
 			log.Trace("Downloading to: ", fileSavePath)
 			// Add Option to Disable / Enable checking download certificate as certain CDNs have invalid / self-signed certificates
 			var checkcertificate bool = manager.config.EnableTlsCheck
 			var ratelimit int = manager.config.DownloadSpeedLimit
-			err = progress_downloader.DownloadFile(checkcertificate, ratelimit, link, fileSavePath, manager.downloadList[item.Name].ProgressDownloader)
+			// Read the progress counter under the downloadList lock: an
+			// unlocked map read here would race with the locked writes
+			// made by other top-level download goroutines.
+			manager.downloadListMutex.Lock()
+			progress := manager.downloadList[downloadKey(parentFolderID, child.Name)].ProgressDownloader
+			manager.downloadListMutex.Unlock()
+			err = progress_downloader.DownloadFile(checkcertificate, ratelimit, link, fileSavePath, progress)
 			if err != nil {
-				manager.removeDownload(item.Name)
-				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading file %s: %s, continuing with other files", item.Name, err)
+				manager.removeDownload(parentFolderID, child.Name)
+				manager.markDownloadFailed(parentFolderID, child.Name)
+				log.Errorf("Error downloading file %s: %s, continuing with other files", child.Name, err)
 				folderHasErrors = true
 				continue // Continue with next file instead of aborting
 			}
-			manager.removeDownload(item.Name)
-		} else if item.Type == "folder" {
-			err = manager.downloadFolderRecursively(item, savePath)
+			manager.removeDownload(parentFolderID, child.Name)
+		} else if child.Type == "folder" {
+			err = manager.downloadFolderRecursively(child, savePath)
 			if err != nil {
-				manager.markDownloadFailed(item.Name)
-				log.Errorf("Error downloading folder %s: %s, continuing with other items", item.Name, err)
+				manager.markDownloadFailed(parentFolderID, child.Name)
+				log.Errorf("Error downloading folder %s: %s, continuing with other items", child.Name, err)
 				folderHasErrors = true
 				continue // Continue with next item instead of aborting
 			}

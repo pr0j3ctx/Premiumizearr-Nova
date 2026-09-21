@@ -178,12 +178,31 @@ func (manager *TransferManagerService) resolveArrFolders() {
 		return
 	}
 
-	newFolders := make(map[string]string, len(manager.config.Arrs))
+	// Seed the new map with the previously tracked slugs as empty-ID entries:
+	// an Arr that is renamed away or that fails re-resolution must stay in the
+	// map, because the map doubles as the root-scan exclusion list - a slug
+	// that leaves the map makes its pme folder downloadable and deletable
+	// again. An empty ID means "tracked, excluded, not processed".
+	manager.arrFoldersMutex.Lock()
+	oldSlugs := make([]string, 0, len(manager.arrFolders))
+	for slug := range manager.arrFolders {
+		oldSlugs = append(oldSlugs, slug)
+	}
+	manager.arrFoldersMutex.Unlock()
+
+	newFolders := make(map[string]string, len(oldSlugs)+len(manager.config.Arrs))
+	for _, slug := range oldSlugs {
+		newFolders[slug] = ""
+	}
 
 	for _, arr := range manager.config.Arrs {
 		id, err := utils.GetOrCreateSubfolderID(manager.premiumizemeClient, manager.downloadsFolderID, arr.Name)
 		if err != nil {
 			log.Errorf("Cannot resolve premiumize.me subfolder for Arr %s: %s", arr.Name, err)
+			// Unresolved means "keep": the slug stays tracked with an empty
+			// ID so its pme folder remains excluded from the root scan's
+			// download-and-delete path until resolution succeeds again.
+			newFolders[arr.Name] = ""
 			continue
 		}
 		newFolders[arr.Name] = id
@@ -191,6 +210,12 @@ func (manager *TransferManagerService) resolveArrFolders() {
 		local := filepath.Join(manager.config.DownloadsDirectory, arr.Name)
 		if err := os.MkdirAll(local, os.ModePerm); err != nil {
 			log.Errorf("Cannot create downloads subfolder for Arr %s: %s", arr.Name, err)
+			// The slug stays tracked (empty ID) instead of being dropped:
+			// dropping it would re-expose its pme folder to the root scan,
+			// while the download path recreates missing parents itself and
+			// the next resolution run retries the MkdirAll.
+			newFolders[arr.Name] = ""
+			continue
 		}
 	}
 
@@ -604,6 +629,11 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 	}
 
 	for slug, folderID := range arrFolders {
+		if folderID == "" {
+			// Tracked but unresolved: the pme folder stays excluded from the
+			// root scan, and there is nothing to process for this slug yet.
+			continue
+		}
 		localDir := filepath.Join(manager.config.DownloadsDirectory, slug)
 		if !manager.checkFolder(folderID, localDir, nil) {
 			return // SimultaneousDownloads cap reached
@@ -619,8 +649,10 @@ func (manager *TransferManagerService) checkFolder(premiumizeFolderID, localDir 
 	}
 
 	for _, item := range items {
-		// Skip the Arr container folders themselves - they are scanned separately.
-		if excludeNames[item.Name] {
+		// Skip the Arr container folders themselves - they are scanned
+		// separately. Only folders count: a file named like a configured
+		// slug is a regular download, not an Arr subfolder.
+		if item.Type == "folder" && excludeNames[item.Name] {
 			continue
 		}
 
@@ -785,7 +817,10 @@ func (manager *TransferManagerService) downloadFolderRecursively(item premiumize
 	}
 	savePath := path.Join(downloadDirectory, (item.Name + "/"))
 	log.Trace("Downloading to: ", savePath)
-	err = os.Mkdir(savePath, os.ModePerm)
+	// MkdirAll (not Mkdir): a missing intermediate directory - e.g. an Arr
+	// subfolder whose creation failed at resolution time - is recreated
+	// instead of failing every download into a permanent cooldown loop.
+	err = os.MkdirAll(savePath, os.ModePerm)
 	if err != nil {
 		log.Errorf("could not create save path: %s", err)
 		//		manager.removeDownload(item.Name)

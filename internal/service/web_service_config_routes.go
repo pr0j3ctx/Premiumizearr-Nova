@@ -146,12 +146,18 @@ func (s *WebServerService) ConfigHandler(w http.ResponseWriter, r *http.Request)
 			})
 			return
 		}
-		if err := config.ValidateArrs(newConfig.Arrs); err != nil {
-			EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
-				Succeeded: false,
-				Status:    err.Error(),
-			})
-			return
+		// Mirror the startup gate in LoadOrCreateConfig: slug validation
+		// applies only with the feature on, so an upgrade whose legacy
+		// config.yaml still carries capitalized names can save unrelated
+		// changes without being forced to retype every Arr name.
+		if newConfig.EnableArrSubfolders {
+			if err := config.ValidateArrs(newConfig.Arrs); err != nil {
+				EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{
+					Succeeded: false,
+					Status:    err.Error(),
+				})
+				return
+			}
 		}
 		s.config.UpdateConfig(newConfig)
 		EncodeAndWriteConfigChangeResponse(w, &ConfigChangeResponse{

@@ -1,11 +1,14 @@
 package directory_watcher
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 
 	"github.com/fsnotify/fsnotify"
 )
+
+var errWatcherNotInitialized = errors.New("watcher not initialized")
 
 // NewWatchDirectory creates a new WatchDirectory.
 func NewDirectoryWatcher(path string, recursive bool, matchFunction func(string) int, callbackFunction func(string)) *WatchDirectory {
@@ -65,20 +68,32 @@ func (w *WatchDirectory) Watch() error {
 
 // AddWatchPath watches an additional directory on top of the root Path
 func (w *WatchDirectory) AddWatchPath(path string) error {
+	if w == nil || w.Watcher == nil {
+		return errWatcherNotInitialized
+	}
 	return w.Watcher.Add(filepath.Clean(path))
 }
 
 // RemoveWatchPath stops watching a directory previously added via AddWatchPath
 func (w *WatchDirectory) RemoveWatchPath(path string) error {
+	if w == nil || w.Watcher == nil {
+		return errWatcherNotInitialized
+	}
 	return w.Watcher.Remove(filepath.Clean(path))
 }
 
 func (w *WatchDirectory) UpdatePath(path string) error {
+	if w == nil || w.Watcher == nil {
+		return errWatcherNotInitialized
+	}
 	w.Watcher.Remove(w.Path)
 	w.Path = path
 	return w.Watcher.Add(w.Path)
 }
 
 func (w *WatchDirectory) Stop() error {
+	if w == nil || w.Watcher == nil {
+		return nil
+	}
 	return w.Watcher.Close()
 }

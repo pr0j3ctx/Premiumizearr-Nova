@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sync"
 )
 
 var (
@@ -54,11 +53,6 @@ func ValidateArrs(arrs []ArrConfig) error {
 type Config struct {
 	altConfigLocation string
 	appCallback       AppCallback
-	// updateMu is the mutex the owning service takes around the in-place
-	// replacement in UpdateConfig; goroutines that read config fields under
-	// the same mutex's read lock cannot observe a torn struct swap. Nil (the
-	// default) leaves the swap unlocked.
-	updateMu *sync.RWMutex
 
 	//PremiumizemeAPIKey string with yaml and json tag
 	PremiumizemeAPIKey string `yaml:"PremiumizemeAPIKey" json:"PremiumizemeAPIKey"`

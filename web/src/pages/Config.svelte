@@ -274,8 +274,12 @@
                 }}
                 on:blur={() => {
                   // Normalize on blur, not on input: rewriting the bound
-                  // value while typing moves the caret.
-                  arr.Name = trimSlugEdges(slugify(arr.Name));
+                  // value while typing moves the caret. Only while the
+                  // per-Arr subfolders feature is on: the slug form is
+                  // only meaningful for it.
+                  if (config.EnableArrSubfolders) {
+                    arr.Name = trimSlugEdges(slugify(arr.Name));
+                  }
                 }}
               />
               <TextInput

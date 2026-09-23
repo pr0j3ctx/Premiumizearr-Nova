@@ -95,13 +95,25 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 	if s.directoryWatcherService == nil || s.directoryWatcherService.Queue == nil {
 		resp.Status = "Not Initialized"
 	} else {
+		// The config swap lock read: the web save goroutine replaces the
+		// whole config struct in place, and BlackholeDirectory must be
+		// read under the same mutex's read lock as the swap or the loop
+		// below can observe a torn string header.
+		blackholeDir := ""
+		if mu := config.UpdateMu(); mu != nil {
+			mu.RLock()
+			blackholeDir = s.config.BlackholeDirectory
+			mu.RUnlock()
+		} else {
+			blackholeDir = s.config.BlackholeDirectory
+		}
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
 			// filepath (not path): fsnotify event names carry the platform
 			// separator (backslashes on Windows), and Clean/Dir/Base
 			// normalize both styles on both platforms.
 			name := filepath.Base(n)
 			arr := ""
-			if filepath.Dir(n) != filepath.Clean(s.config.BlackholeDirectory) {
+			if filepath.Dir(n) != filepath.Clean(blackholeDir) {
 				arr = filepath.Base(filepath.Dir(n))
 			}
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{

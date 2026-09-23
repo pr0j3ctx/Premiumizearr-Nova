@@ -570,8 +570,9 @@ func TestManagerRenamedArrStaysExcludedFromRootScan(t *testing.T) {
 
 // TestCheckFolderSkipsOnlyFolderItemsNamedLikeSlugs is the regression test
 // for finding R1-6: the root-scan exclusion applies to folders only - a
-// completed FILE named like a configured Arr slug must be processed, not
-// skipped on every poll forever.
+// completed FILE named like a tracked Arr slug must be processed, not
+// skipped on every poll forever. The name layer applies to slugs without
+// a resolved pme folder (the only signal left is the name).
 func TestCheckFolderSkipsOnlyFolderItemsNamedLikeSlugs(t *testing.T) {
 	stub := newPmeStub(t, false)
 	stub.mu.Lock()
@@ -589,9 +590,9 @@ func TestCheckFolderSkipsOnlyFolderItemsNamedLikeSlugs(t *testing.T) {
 		TransferDirectory:     "arrDownloads",
 		SimultaneousDownloads: 5,
 		DownloadSpeedLimit:    100,
-	}, map[string]string{"sonarr": "arr-folder-id"})
+	}, map[string]string{"sonarr": ""}) // unresolved slug: name-only exclusion
 
-	if !m.checkFolder("main-id", m.config.DownloadsDirectory, map[string]bool{"sonarr": true}, nil) {
+	if !m.checkFolder("main-id", m.config.DownloadsDirectory, rootExclusions{byName: map[string]bool{"sonarr": true}}) {
 		t.Fatalf("checkFolder returned false, want true (cap not reached)")
 	}
 
@@ -600,7 +601,7 @@ func TestCheckFolderSkipsOnlyFolderItemsNamedLikeSlugs(t *testing.T) {
 	if !stub.anyCall(func(c pmeCall) bool {
 		return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr.folder" && c.Query["parent_id"] == "main-id"
 	}) {
-		t.Fatalf("file item named like a configured slug was not processed: calls = %v", stub.calls)
+		t.Fatalf("file item named like a tracked slug was not processed: calls = %v", stub.calls)
 	}
 
 	// The folder container must stay excluded from the root scan's
@@ -739,10 +740,12 @@ func TestManagerKeepsTransferDestinationFoldersAcrossRestart(t *testing.T) {
 	})
 }
 
-// TestManagerTransferDestinationsIgnoredWhenFeatureOff proves the identity
-// layer is gated on EnableArrSubfolders: with the feature off, a folder
-// that is a transfer destination is still processed (downloaded and
-// deleted), exactly like before the per-Arr subfolders feature existed.
+// TestManagerTransferDestinationsIgnoredWhenFeatureOff proves a fresh
+// feature-off install keeps the exact pre-feature behavior: with the
+// feature off and nothing ever tracked (empty arrFolders map), the
+// exclusion layers stay off and a folder that is a transfer destination
+// is still processed (downloaded and deleted). The layers only turn on
+// once the feature has been on and tracked folders exist.
 func TestManagerTransferDestinationsIgnoredWhenFeatureOff(t *testing.T) {
 	stub := newPmeStub(t, false)
 	stub.mu.Lock()
@@ -845,5 +848,824 @@ func TestCheckFolderSameNameInDifferentArrFolders(t *testing.T) {
 				return c.Path == "/api/folder/delete" && c.Query["id"] == id
 			}
 		}(id))
+	}
+}
+
+// TestProcessUploadUnresolvedTargetRequeues is the regression test for
+// findings C-2 and C-8: a file with no resolved target yet (the transfers
+// folder never resolved, or the Arr subfolder still unresolved) must be
+// re-queued for a later retry instead of being dropped, and an empty main
+// folder ID must not be treated as a valid target (which would submit the
+// file to the account root). Once the target resolves, the file uploads.
+func TestProcessUploadUnresolvedTargetRequeues(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	t.Run("root file with unresolved main folder re-queues instead of dropping", func(t *testing.T) {
+		stub := newPmeStub(t, false)
+		bh := t.TempDir()
+		file := filepath.Join(bh, "root.magnet")
+		if err := os.WriteFile(file, []byte("magnet:?xt=urn:btih:a"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		dw := newArrSubfolderTestService(t, stub, bh, true, []config.ArrConfig{sonarr})
+		// pme was down at startup: the transfers folder was never resolved.
+		dw.downloadsFolderID = ""
+		dw.Queue.Add(file)
+
+		if n := dw.processUploadCycle(); n != 0 {
+			t.Fatalf("cycle processed %d files, want 0 (unresolved target re-queued)", n)
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("source file removed although no target resolved: %v", err)
+		}
+		if got := stub.transferTargets; len(got) != 0 {
+			t.Fatalf("transfer submitted without a resolved target: %v", got)
+		}
+		if q := dw.Queue.GetQueue(); len(q) != 1 || q[0] != file {
+			t.Fatalf("file not re-queued for retry: %v", q)
+		}
+
+		// The transfers folder resolves (pme recovered).
+		dw.mu.Lock()
+		dw.downloadsFolderID = "main-id"
+		dw.mu.Unlock()
+		if n := dw.processUploadCycle(); n != 1 {
+			t.Fatalf("recovery cycle processed %d files, want 1", n)
+		}
+		if got := stub.transferTargets; len(got) != 1 || got[0] != "main-id" {
+			t.Fatalf("recovery transfer targets = %v, want [main-id]", got)
+		}
+		if _, err := os.Stat(file); !os.IsNotExist(err) {
+			t.Fatalf("source file not removed after the successful transfer")
+		}
+	})
+
+	t.Run("subfolder file with unresolved main folder re-queues until the slug resolves", func(t *testing.T) {
+		stub := newPmeStub(t, false)
+		bh := t.TempDir()
+		sub := filepath.Join(bh, "sonarr")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(sub, "episode.nzb")
+		if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		dw := newArrSubfolderTestService(t, stub, bh, true, []config.ArrConfig{sonarr})
+		dw.downloadsFolderID = ""
+		dw.Queue.Add(file)
+
+		if n := dw.processUploadCycle(); n != 0 {
+			t.Fatalf("cycle processed %d files, want 0", n)
+		}
+		// No pme traffic at all: the empty parent ID must not list or
+		// create at the account root.
+		if stub.anyCall(func(c pmeCall) bool {
+			return c.Path == "/api/folder/list" || c.Path == "/api/folder/create"
+		}) {
+			t.Fatalf("pme traffic with an empty main folder ID: %v", stub.calls)
+		}
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("source file removed although no target resolved: %v", err)
+		}
+
+		dw.mu.Lock()
+		dw.downloadsFolderID = "main-id"
+		dw.mu.Unlock()
+		if n := dw.processUploadCycle(); n != 1 {
+			t.Fatalf("recovery cycle processed %d files, want 1", n)
+		}
+		if got := stub.transferTargets; len(got) != 1 || got[0] == "" || got[0] == "main-id" {
+			t.Fatalf("recovery transfer targets = %v, want the resolved Arr subfolder", got)
+		}
+		if len(stub.createdFolders) != 1 || stub.createdFolders[0] != "sonarr" {
+			t.Fatalf("pme folders created = %v, want [sonarr]", stub.createdFolders)
+		}
+	})
+}
+
+// TestResolveArrFoldersEmptyMainFolderIDMakesNoPmeTraffic is the
+// regression test for finding C-9: with the transfers folder unresolved
+// (empty main folder ID), the bulk resolve must not list or create at the
+// account root; it keeps the previous mapping (or an empty-ID placeholder)
+// and retries on the next resolve.
+func TestResolveArrFoldersEmptyMainFolderIDMakesNoPmeTraffic(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, false)
+	bh := t.TempDir()
+	dw := newArrSubfolderTestService(t, stub, bh, true, []config.ArrConfig{sonarr})
+	dw.downloadsFolderID = ""
+
+	dw.resolveArrFolders()
+
+	if stub.anyCall(func(c pmeCall) bool {
+		return c.Path == "/api/folder/list" || c.Path == "/api/folder/create"
+	}) {
+		t.Fatalf("pme traffic with an empty main folder ID: %v", stub.calls)
+	}
+	dw.mu.RLock()
+	id, present := dw.arrFolders["sonarr"]
+	dw.mu.RUnlock()
+	if !present || id != "" {
+		t.Fatalf("arrFolders[sonarr] = %q, present=%v; want an empty-ID placeholder", id, present)
+	}
+	if _, err := os.Stat(filepath.Join(bh, "sonarr")); err != nil {
+		t.Fatalf("blackhole subfolder not created: %v", err)
+	}
+}
+
+// TestResolveSingleArrFolderConfigChangeMidFlight is the regression test
+// for finding C-5: the on-demand resolve checks the feature flag and the
+// slug's presence under a read lock, then does the pme round trip, then
+// writes the map under the write lock. A config swap in that window
+// (feature toggled off, slug removed) must be seen by a re-validation
+// under the write lock, or the stale write resurrects an entry a
+// concurrent bulk resolve just dropped - and its watch leaks.
+func TestResolveSingleArrFolderConfigChangeMidFlight(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+	bh := t.TempDir()
+	dw := NewDirectoryWatcherService()
+	cfg := &config.Config{
+		BlackholeDirectory:  bh,
+		TransferDirectory:   "arrDownloads",
+		EnableArrSubfolders: true,
+		Arrs:                []config.ArrConfig{sonarr},
+	}
+
+	var mu sync.Mutex
+	created := false
+	gate := make(chan struct{})
+	gated := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/folder/list":
+			close(gated)
+			<-gate
+			writeJSON(w, map[string]any{"status": "success", "content": []premiumizeme.Item{}})
+		case r.URL.Path == "/api/folder/create":
+			mu.Lock()
+			created = true
+			mu.Unlock()
+			writeJSON(w, map[string]any{"status": "success", "id": "created-1"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := premiumizeme.NewPremiumizemeClient("test-key")
+	client.APIBaseURL = server.URL + "/api/"
+	client.HTTPClient = server.Client()
+	dw.Init(&client, cfg)
+	dw.Queue = stringqueue.NewStringQueue()
+	dw.downloadsFolderID = "main-id"
+
+	done := make(chan struct{})
+	go func() {
+		dw.resolveSingleArrFolder("sonarr", "main-id")
+		close(done)
+	}()
+
+	<-gated // the pme round trip is in flight
+	// Toggle the feature off (and remove the slug) while it is in flight.
+	cfg.EnableArrSubfolders = false
+	cfg.Arrs = nil
+	close(gate)
+	<-done
+
+	mu.Lock()
+	roundTripCompleted := created
+	mu.Unlock()
+	if !roundTripCompleted {
+		t.Fatal("the pme round trip did not complete; the test cannot prove the write was skipped")
+	}
+	dw.mu.RLock()
+	id, present := dw.arrFolders["sonarr"]
+	dw.mu.RUnlock()
+	if present {
+		t.Fatalf("arrFolders[sonarr] = %q; the stale resolve must not resurrect an entry the config change dropped", id)
+	}
+}
+
+// TestResolveArrFoldersPmeFailureTracksUnresolvedSlug is the regression
+// test for finding C-6: a slug whose pme resolution fails is tracked with
+// an empty-ID entry, so a watch registered for its local subfolder is
+// removed by the same map-keyed loops as every other watch instead of
+// leaking when the blackhole changes, the feature toggles off, or the
+// slug is removed.
+func TestResolveArrFoldersPmeFailureTracksUnresolvedSlug(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, true)
+	bh := t.TempDir()
+	dw := newArrSubfolderTestService(t, stub, bh, true, []config.ArrConfig{sonarr})
+
+	dw.resolveArrFolders()
+
+	dw.mu.RLock()
+	id, present := dw.arrFolders["sonarr"]
+	dw.mu.RUnlock()
+	if !present {
+		t.Fatal("a slug that failed resolution is not tracked: its subfolder watch can never be removed")
+	}
+	if id != "" {
+		t.Fatalf("arrFolders[sonarr] = %q, want an empty-ID placeholder", id)
+	}
+	if _, err := os.Stat(filepath.Join(bh, "sonarr")); err != nil {
+		t.Fatalf("blackhole subfolder not created during the pme outage: %v", err)
+	}
+}
+
+// TestResolveArrFoldersConcurrentRunsSerialize is the regression test for
+// finding C-7: the startup resolve and a config-callback resolve can run
+// concurrently, each ending with a full map replacement; serialized runs
+// must end in a map consistent with the last run's config, not a torn
+// commit where one run's replacement erases the other run's entry.
+func TestResolveArrFoldersConcurrentRunsSerialize(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+	radarr := config.ArrConfig{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "k", Type: config.Radarr}
+	bh := t.TempDir()
+
+	// A pme whose create is slow enough that the second resolve's config
+	// change lands inside the first run's network window.
+	var tableMu sync.Mutex
+	table := map[string][]premiumizeme.Item{"main-id": {}}
+	nextID := 0
+	firstListed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/folder/list":
+			id := r.URL.Query().Get("id")
+			tableMu.Lock()
+			items := table[id]
+			tableMu.Unlock()
+			select {
+			case <-firstListed:
+			default:
+				close(firstListed)
+			}
+			writeJSON(w, map[string]any{"status": "success", "content": items})
+		case r.URL.Path == "/api/folder/create":
+			name := r.URL.Query().Get("name")
+			parent := r.URL.Query().Get("parent_id")
+			time.Sleep(150 * time.Millisecond)
+			tableMu.Lock()
+			nextID++
+			id := fmt.Sprintf("created-%d", nextID)
+			table[parent] = append(table[parent], premiumizeme.Item{ID: id, Name: name, Type: "folder"})
+			tableMu.Unlock()
+			writeJSON(w, map[string]any{"status": "success", "id": id})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := premiumizeme.NewPremiumizemeClient("test-key")
+	client.APIBaseURL = server.URL + "/api/"
+	client.HTTPClient = server.Client()
+
+	cfg := &config.Config{
+		BlackholeDirectory:  bh,
+		TransferDirectory:   "arrDownloads",
+		EnableArrSubfolders: true,
+		Arrs:                []config.ArrConfig{sonarr},
+	}
+	dw := NewDirectoryWatcherService()
+	dw.Init(&client, cfg)
+	dw.Queue = stringqueue.NewStringQueue()
+	dw.downloadsFolderID = "main-id"
+
+	aDone := make(chan struct{})
+	go func() {
+		dw.resolveArrFolders()
+		close(aDone)
+	}()
+
+	<-firstListed // the first resolve is in its pme window
+	// Second resolve (config-callback shape) while the first is in flight:
+	// the config now carries a different Arr set.
+	cfg.Arrs = []config.ArrConfig{radarr}
+	dw.resolveArrFolders()
+	<-aDone
+
+	dw.mu.RLock()
+	sonarrID, sonarrOK := dw.arrFolders["sonarr"]
+	radarrID, radarrOK := dw.arrFolders["radarr"]
+	total := len(dw.arrFolders)
+	dw.mu.RUnlock()
+	// The config at the end is [radarr], and both runs serialize
+	// snapshot→pme→commit under the same lock, so the final map must be
+	// exactly the newer run's snapshot result: radarr resolved; no sonarr
+	// (an older snapshot's commit landing after the newer run's is the
+	// C-7 torn commit, leaving the map inconsistent with the config);
+	// no mixture of the two snapshots in one map.
+	if !radarrOK || radarrID == "" {
+		t.Fatalf("final map missing the last run's resolved slug: sonarr=%q(%v) radarr=%q(%v)", sonarrID, sonarrOK, radarrID, radarrOK)
+	}
+	if sonarrOK {
+		t.Fatalf("an older snapshot's commit landed after the newer run's: final map = stale state (the C-7 torn commit): sonarr=%q radarr=%q", sonarrID, radarrID)
+	}
+	if total != 1 {
+		t.Fatalf("final map mixes slugs from two runs' snapshots: %d entries", total)
+	}
+}
+
+// TestWatcherHandleRaceBetweenStartAndCallback is the regression test for
+// finding C-12: the Start() goroutine and the web config callback can both
+// create, replace, or nil the watcher handle; every read and write of the
+// handle must take the service lock, or the pair is torn (and -race flags
+// the unsynchronized pointer access).
+func TestWatcherHandleRaceBetweenStartAndCallback(t *testing.T) {
+	bh1 := t.TempDir()
+	bh2 := t.TempDir()
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	dw := NewDirectoryWatcherService()
+	// The callback is installed through the product load path so the
+	// unexported appCallback/altConfigLocation fields are set the way
+	// cmd/premiumizearrd sets them.
+	cfg, err := config.LoadOrCreateConfig(t.TempDir(), func(oldConfig, newConfig config.Config) {
+		dw.ConfigUpdatedCallback(oldConfig, newConfig)
+	})
+	if err != nil {
+		t.Fatalf("LoadOrCreateConfig: %v", err)
+	}
+	cfg.BlackholeDirectory = bh1
+	cfg.DownloadsDirectory = t.TempDir()
+	cfg.TransferDirectory = "arrDownloads"
+	cfg.EnableArrSubfolders = true
+	cfg.Arrs = []config.ArrConfig{sonarr}
+
+	stub := newPmeStub(t, false)
+	dw.Init(newPmeTestClient(t, stub), &cfg)
+	dw.Queue = stringqueue.NewStringQueue()
+	dw.downloadsFolderID = "main-id"
+
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Web-save shape: whole-struct swaps alternating the blackhole
+	// target, which is what drives the callback's watcher restart.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			newCfg := config.Config{
+				PremiumizemeAPIKey:                      "test-key",
+				BlackholeDirectory:                      bh1,
+				DownloadsDirectory:                      cfg.DownloadsDirectory,
+				TransferDirectory:                       "arrDownloads",
+				PollBlackholeIntervalMinutes:            10,
+				SimultaneousDownloads:                   5,
+				DownloadSpeedLimit:                      100,
+				ArrHistoryUpdateIntervalSeconds:         20,
+				ErroredTransferDeleteGracePeriodSeconds: 300,
+			}
+			if i%2 == 0 {
+				newCfg.EnableArrSubfolders = true
+				newCfg.Arrs = []config.ArrConfig{sonarr}
+			} else {
+				newCfg.EnableArrSubfolders = false
+				newCfg.Arrs = []config.ArrConfig{}
+				newCfg.BlackholeDirectory = bh2
+			}
+			cfg.UpdateConfig(newCfg)
+		}
+	}()
+
+	// Start() shape: the one-shot watcher setup racing the callback's
+	// handle replacements.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		dw.Start()
+	}()
+
+	close(start)
+	time.Sleep(2000 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	// Let callback-spawned directory scans drain before the temp dirs go.
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestManagerToggleOffKeepsArrContainersExcluded is the regression test
+// for finding C-13: toggling the feature off must not clear the tracked
+// folder IDs - the pme containers this client created stay excluded from
+// the root scan's download-and-delete path (with their unprocessed
+// remainder still downloaded into the local subfolder), otherwise the next
+// scan downloads the container's content into the main downloads directory
+// and deletes the container from premiumize.me.
+func TestManagerToggleOffKeepsArrContainersExcluded(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "sonarr-id", Name: "sonarr", Type: "folder"}, // container this client created
+		{ID: "show-id", Name: "Show.S01", Type: "folder"}, // transferred content
+	}
+	stub.table["sonarr-id"] = []premiumizeme.Item{}
+	stub.table["show-id"] = []premiumizeme.Item{}
+	stub.mu.Unlock()
+
+	cfg := &config.Config{
+		EnableArrSubfolders:   true,
+		Arrs:                  []config.ArrConfig{sonarr},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}
+	m := newManagerTestService(t, stub, cfg, nil)
+
+	m.resolveArrFolders()
+	m.arrFoldersMutex.Lock()
+	containerID := m.arrFolders["sonarr"]
+	m.arrFoldersMutex.Unlock()
+	if containerID == "" {
+		t.Fatalf("the Arr container was not resolved: %v", m.arrFolders)
+	}
+
+	// The user toggles the feature off (web save -> callback -> resolve).
+	newCfg := *cfg
+	newCfg.EnableArrSubfolders = false
+	m.ConfigUpdatedCallback(*cfg, newCfg)
+
+	m.arrFoldersMutex.Lock()
+	kept, present := m.arrFolders["sonarr"]
+	m.arrFoldersMutex.Unlock()
+	if !present || kept == "" {
+		t.Fatalf("toggle-off cleared the tracked container: present=%v id=%q", present, kept)
+	}
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// The retained container must not be handed to the download path
+	// (listing, child downloads, or deletion).
+	assertNoCallWithin(t, stub, time.Second, "retained Arr container was handed to the download path with the feature off", func(c pmeCall) bool {
+		return c.Query["id"] == "sonarr-id" && c.Path == "/api/folder/delete"
+	})
+
+	// Regular transferred content is unaffected and still processed end
+	// to end: listed, downloaded (empty here) and deleted.
+	waitForCall(t, stub, 5*time.Second, "content folder was not processed with the feature off", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "show-id"
+	})
+}
+
+// TestCheckFolderContentFolderNamedLikeResolvedSlugIsProcessed is the
+// regression test for finding C-10: a slug whose pme folder IS resolved
+// is excluded by folder ID, not by name - so a legitimate content folder
+// that happens to be named like the slug is still processed by the root
+// scan.
+func TestCheckFolderContentFolderNamedLikeResolvedSlugIsProcessed(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "sonarr-id", Name: "sonarr-container", Type: "folder"}, // resolved container
+		{ID: "content-sonarr-id", Name: "sonarr", Type: "folder"},   // content named like the slug
+	}
+	stub.table["sonarr-id"] = []premiumizeme.Item{}
+	stub.table["content-sonarr-id"] = []premiumizeme.Item{}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   true,
+		Arrs:                  []config.ArrConfig{sonarr},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, map[string]string{"sonarr": "sonarr-id"})
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// The resolved container is excluded by its ID: never admitted, never
+	// deleted (the per-slug pass lists it to process its content, but the
+	// stubbed container is empty, so it is never admitted either).
+	assertNoCallWithin(t, stub, time.Second, "resolved Arr container was deleted by the root scan", func(c pmeCall) bool {
+		return c.Query["id"] == "sonarr-id" && c.Path == "/api/folder/delete"
+	})
+
+	// A content folder named like the resolved slug is still processed.
+	waitForCall(t, stub, 5*time.Second, "content folder named like a resolved slug was not processed", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "content-sonarr-id"
+	})
+}
+
+// TestCheckFolderTrackedRenamedFolderKeptByID is the regression test for
+// finding C-15: a tracked pme folder that the user renames on pme keeps
+// its ID; the ID-based exclusion layer recognizes it even though the name
+// no longer matches any tracked slug and no transfer in the cache points
+// at it anymore.
+func TestCheckFolderTrackedRenamedFolderKeptByID(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "sonarr-id", Name: "renamed-by-user", Type: "folder"}, // tracked container, renamed on pme
+	}
+	stub.table["sonarr-id"] = []premiumizeme.Item{}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   true,
+		Arrs:                  []config.ArrConfig{sonarr},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, map[string]string{"sonarr": "sonarr-id"})
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// The renamed tracked folder must not be downloaded and deleted:
+	// only its ID can still recognize it.
+	assertNoCallWithin(t, stub, time.Second, "tracked folder renamed on pme was deleted by the root scan", func(c pmeCall) bool {
+		return c.Query["id"] == "sonarr-id" && c.Path == "/api/folder/delete"
+	})
+}
+
+// TestNestedTransferDestinationFolderKeptWithParent is the regression
+// test for finding C-14: a client-managed routing folder NESTED inside a
+// transfer content folder must not be downloaded and deleted with its
+// parent - the parent job fails instead, keeping the whole subtree on
+// premiumize.me.
+func TestNestedTransferDestinationFolderKeptWithParent(t *testing.T) {
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["main-id"] = []premiumizeme.Item{
+		{ID: "show-id", Name: "Show.S01", Type: "folder"},
+	}
+	stub.table["show-id"] = []premiumizeme.Item{
+		{ID: "dest-nested-id", Name: "nested-arr-folder", Type: "folder"},
+	}
+	stub.table["dest-nested-id"] = []premiumizeme.Item{}
+	stub.transfers = []premiumizeme.Transfer{
+		{ID: "t1", Name: "feed", Status: "finished", FolderID: "dest-nested-id"},
+	}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   true,
+		Arrs:                  []config.ArrConfig{sonarr},
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, nil)
+
+	// Simulate Run()'s TaskUpdateTransfersList having populated the cache
+	// in the same goroutine before this task ran.
+	m.transfers = append([]premiumizeme.Transfer(nil), stub.transfers...)
+
+	m.TaskCheckPremiumizeDownloadsFolder()
+
+	// The nested routing folder is kept, and the parent job fails instead
+	// of deleting the whole subtree.
+	assertNoCallWithin(t, stub, time.Second, "nested routing folder was deleted with its parent", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "dest-nested-id"
+	})
+	assertNoCallWithin(t, stub, time.Second, "parent of a kept nested routing folder was deleted", func(c pmeCall) bool {
+		return c.Path == "/api/folder/delete" && c.Query["id"] == "show-id"
+	})
+}
+
+// TestUpdateConfigRaceAgainstManagerAndWebReaders is the regression test
+// for finding C-1: the transfer manager's poll-loop config reads and the
+// web BlackholeHandler's BlackholeDirectory read must take the registered
+// config swap lock's read lock, like the watcher's readers already do.
+// Run with -race; the pre-fix tree reports data races on the unlocked
+// manager/web config field reads against the locked in-place swap.
+func TestUpdateConfigRaceAgainstManagerAndWebReaders(t *testing.T) {
+	bh1 := t.TempDir()
+	bh2 := t.TempDir()
+	sonarr := config.ArrConfig{Name: "sonarr", URL: "http://127.0.0.1:8989", APIKey: "k", Type: config.Sonarr}
+	radarr := config.ArrConfig{Name: "radarr", URL: "http://127.0.0.1:7878", APIKey: "k", Type: config.Radarr}
+
+	cfg, err := config.LoadOrCreateConfig(t.TempDir(), func(oldConfig, newConfig config.Config) {})
+	if err != nil {
+		t.Fatalf("LoadOrCreateConfig: %v", err)
+	}
+	cfg.BlackholeDirectory = bh1
+	cfg.DownloadsDirectory = t.TempDir()
+	cfg.TransferDirectory = "arrDownloads"
+	cfg.EnableArrSubfolders = true
+	cfg.Arrs = []config.ArrConfig{sonarr}
+	var mu sync.RWMutex
+	config.SetUpdateMu(&mu)
+
+	stub := newPmeStub(t, false)
+	m := TransferManagerService{}.New()
+	m.premiumizemeClient = newPmeTestClient(t, stub)
+	m.config = &cfg
+	m.downloadsFolderID = "main-id"
+	m.transfers = []premiumizeme.Transfer{{ID: "t1", Name: "feed", Status: "finished", FolderID: "dest-x"}}
+
+	// The web reader shape: BlackholeHandler reads BlackholeDirectory on
+	// every request.
+	dw := NewDirectoryWatcherService()
+	dw.config = &cfg
+	dw.Queue = stringqueue.NewStringQueue()
+	dw.Queue.Add(filepath.Join(bh1, "a.magnet"))
+	web := &WebServerService{directoryWatcherService: &dw, config: &cfg}
+
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Web-save shape: whole-struct swap through UpdateConfig.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			newCfg := config.Config{
+				PremiumizemeAPIKey:                      "test-key",
+				BlackholeDirectory:                      bh1,
+				DownloadsDirectory:                      cfg.DownloadsDirectory,
+				TransferDirectory:                       "arrDownloads",
+				PollBlackholeIntervalMinutes:            10,
+				SimultaneousDownloads:                   5,
+				DownloadSpeedLimit:                      100,
+				ArrHistoryUpdateIntervalSeconds:         20,
+				ErroredTransferDeleteGracePeriodSeconds: 300,
+			}
+			// Vary slice length, toggle and blackhole target on every
+			// swap so the torn-header windows are exercised, like a user
+			// editing the config in the web UI.
+			if i%2 == 0 {
+				newCfg.EnableArrSubfolders = true
+				newCfg.Arrs = []config.ArrConfig{sonarr, radarr}
+			} else {
+				newCfg.EnableArrSubfolders = false
+				newCfg.Arrs = []config.ArrConfig{sonarr}
+				newCfg.BlackholeDirectory = bh2
+			}
+			m.config.UpdateConfig(newCfg)
+		}
+	}()
+
+	// Manager poll-loop shape: the downloads-folder check reads
+	// EnableArrSubfolders, DownloadsDirectory and SimultaneousDownloads
+	// and the tracked map on every cycle.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			m.TaskCheckPremiumizeDownloadsFolder()
+		}
+	}()
+
+	// Web handler shape.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rec := httptest.NewRecorder()
+			web.BlackholeHandler(rec, httptest.NewRequest(http.MethodGet, "/blackhole", nil))
+		}
+	}()
+
+	close(start)
+	time.Sleep(2000 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestDownloadFolderRecursivelyProgressReadsRaceFree is the regression
+// test for finding S-13: the downloadList progress-counter read inside
+// downloadFolderRecursively must run under the download list lock, and a
+// -race test must actually execute that read against concurrent locked
+// writes from other top-level download goroutines - otherwise deleting
+// the lock pair would stay invisible to the race gate.
+func TestDownloadFolderRecursivelyProgressReadsRaceFree(t *testing.T) {
+	// A pme stub whose item details point at a download server that
+	// always fails, so every file child takes the post-read error path.
+	downloadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer downloadSrv.Close()
+
+	var tableMu sync.Mutex
+	table := map[string][]premiumizeme.Item{
+		"folder-a": {{ID: "file-a1", Name: "a1.bin", Type: "file"}},
+		"folder-b": {{ID: "file-b1", Name: "b1.bin", Type: "file"}},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/folder/list":
+			id := r.URL.Query().Get("id")
+			tableMu.Lock()
+			items := table[id]
+			tableMu.Unlock()
+			writeJSON(w, map[string]any{"status": "success", "content": items})
+		case r.URL.Path == "/api/item/details":
+			writeJSON(w, map[string]any{"status": "success", "type": "file", "link": downloadSrv.URL + "/f"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := premiumizeme.NewPremiumizemeClient("test-key")
+	client.APIBaseURL = server.URL + "/api/"
+	client.HTTPClient = server.Client()
+
+	downloads := t.TempDir()
+
+	itemA := premiumizeme.Item{ID: "folder-a", Name: "A", Type: "folder"}
+	itemB := premiumizeme.Item{ID: "folder-b", Name: "B", Type: "folder"}
+
+	for i := 0; i < 4; i++ {
+		// A fresh manager per round: a failed child stays in the
+		// downloadList/cooldown state, so a second run of the same folder
+		// on the same manager would be deduplicated away and never reach
+		// the progress read. Two goroutines share one manager's
+		// downloadList, so A's locked progress read runs against B's
+		// locked addDownload/removeDownload/markDownloadFailed writes.
+		m := TransferManagerService{}.New()
+		m.premiumizemeClient = &client
+		m.config = &config.Config{EnableTlsCheck: true, DownloadSpeedLimit: 0}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := m.downloadFolderRecursively(itemA, downloads, rootExclusions{}); err == nil {
+				t.Error("downloadFolderRecursively returned nil for a failing file child")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := m.downloadFolderRecursively(itemB, downloads, rootExclusions{}); err == nil {
+				t.Error("downloadFolderRecursively returned nil for a failing file child")
+			}
+		}()
+		wg.Wait()
+	}
+}
+
+// TestDownloadFolderRecursivelyCreatesMissingParents is the regression
+// test for finding S-17: the MkdirAll save-path change must be covered -
+// a download into a directory whose parents do not exist (deleted at
+// runtime, or left missing after a failed MkdirAll at resolution) creates
+// the chain instead of failing the job into the 30-minute cooldown loop.
+func TestDownloadFolderRecursivelyCreatesMissingParents(t *testing.T) {
+	stub := newPmeStub(t, false)
+	stub.mu.Lock()
+	stub.table["show-id"] = []premiumizeme.Item{}
+	stub.mu.Unlock()
+
+	m := newManagerTestService(t, stub, &config.Config{
+		EnableArrSubfolders:   true,
+		DownloadsDirectory:    t.TempDir(),
+		TransferDirectory:     "arrDownloads",
+		SimultaneousDownloads: 5,
+		DownloadSpeedLimit:    100,
+	}, nil)
+
+	missing := filepath.Join(t.TempDir(), "does", "not", "exist")
+	err := m.downloadFolderRecursively(premiumizeme.Item{ID: "show-id", Name: "Show", Type: "folder"}, missing, rootExclusions{})
+	if err != nil {
+		t.Fatalf("download into a missing parent chain failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(missing, "Show")); err != nil {
+		t.Fatalf("save path was not created: %v", err)
 	}
 }

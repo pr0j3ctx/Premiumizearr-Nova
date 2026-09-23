@@ -82,10 +82,17 @@ func (w *WatchDirectory) RemoveWatchPath(path string) error {
 	return w.Watcher.Remove(filepath.Clean(path))
 }
 
+// UpdatePath atomically points the watcher at a new directory: the
+// Remove of the old path, the Path update, and the Add of the new path run
+// under the internal lock so two concurrent UpdatePath calls cannot
+// interleave (the watcher would be left with the wrong path or a
+// half-removed watch).
 func (w *WatchDirectory) UpdatePath(path string) error {
 	if w == nil || w.Watcher == nil {
 		return errWatcherNotInitialized
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.Watcher.Remove(w.Path)
 	w.Path = path
 	return w.Watcher.Add(w.Path)

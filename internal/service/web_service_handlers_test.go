@@ -13,67 +13,97 @@ import (
 )
 
 // TestBlackholeHandlerDerivesArrFromPath is the regression test for
-// finding R1-12: the Arr column must be derived with filepath (not path),
-// because fsnotify event names carry the platform separator - on Windows
-// that is a backslash, which path.Base/path.Dir do not split. filepath
-// normalizes both separator styles on both platforms. This test pins the
-// Linux behavior (a file directly under the blackhole root has an empty
-// Arr, a file inside an Arr subfolder carries the subfolder name); the
-// Windows backslash behavior follows from the same filepath calls but is
-// not executable here because CI runs on Linux only.
+// findings R1-12 and S-23. The Arr column must be derived with filepath
+// (not path), because fsnotify event names carry the platform separator -
+// on Windows that is a backslash, which path.Base/path.Dir do not split.
+// filepath normalizes both separator styles on both platforms. And the
+// Arr must be set only for a file directly inside a CURRENTLY CONFIGURED
+// Arr subfolder under the CURRENT blackhole root (the same classification
+// the upload routing uses): a root file, a feature-off file, a file in an
+// arbitrary or unconfigured subfolder, a nested file, and a file in a
+// leftover of a previous blackhole location all report an empty Arr. This
+// test pins the Linux behavior; the Windows backslash behavior follows
+// from the same filepath calls but is not executable here because CI runs
+// on Linux only.
 func TestBlackholeHandlerDerivesArrFromPath(t *testing.T) {
 	bh := t.TempDir()
 	sonarrDir := filepath.Join(bh, "sonarr")
 	if err := os.MkdirAll(sonarrDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-
-	dw := NewDirectoryWatcherService()
-	dw.Queue = stringqueue.NewStringQueue()
-	dw.Queue.Add(filepath.Join(bh, "root-file.magnet"))
-	dw.Queue.Add(filepath.Join(sonarrDir, "episode.magnet"))
-
-	s := &WebServerService{
-		directoryWatcherService: &dw,
-		config:                  &config.Config{BlackholeDirectory: bh},
+	// A leftover of a previous blackhole location that still carries an
+	// Arr-named subfolder: it is not under the current blackhole root, so
+	// its file must not be classified as an Arr file.
+	oldBH := t.TempDir()
+	oldSonarrDir := filepath.Join(oldBH, "sonarr")
+	if err := os.MkdirAll(oldSonarrDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// An unconfigured subfolder under the current blackhole: its name is
+	// not a configured Arr slug, so its file must not be classified as an
+	// Arr file.
+	otherDir := filepath.Join(bh, "pirater")
+	if err := os.MkdirAll(otherDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A nested directory inside the configured subfolder: the Arr is
+	// derived only from the DIRECT parent of the file.
+	nestedDir := filepath.Join(sonarrDir, "season1")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/blackhole", nil)
-	rec := httptest.NewRecorder()
-	s.BlackholeHandler(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("BlackholeHandler status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	tests := []struct {
+		name     string
+		filePath string
+		enabled  bool
+		wantArr  string
+	}{
+		{"file directly inside configured subfolder", filepath.Join(sonarrDir, "episode.magnet"), true, "sonarr"},
+		{"file in blackhole root", filepath.Join(bh, "root-file.magnet"), true, ""},
+		{"feature off", filepath.Join(sonarrDir, "episode-off.magnet"), false, ""},
+		{"unconfigured subfolder", filepath.Join(otherDir, "other.magnet"), true, ""},
+		{"nested inside configured subfolder", filepath.Join(nestedDir, "nested.magnet"), true, ""},
+		{"leftover of previous blackhole", filepath.Join(oldSonarrDir, "old.magnet"), true, ""},
 	}
 
-	var resp BlackholeResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decoding response: %v", err)
-	}
-	if resp.Status == "Not Initialized" {
-		t.Fatal("BlackholeHandler reported Not Initialized for an initialized watcher")
-	}
-	if len(resp.BlackholeFiles) != 2 {
-		t.Fatalf("BlackholeFiles = %v, want 2 entries", resp.BlackholeFiles)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dw := NewDirectoryWatcherService()
+			dw.Queue = stringqueue.NewStringQueue()
+			dw.Queue.Add(tt.filePath)
 
-	byName := map[string]BlackholeFile{}
-	for _, f := range resp.BlackholeFiles {
-		byName[f.Name] = f
-	}
-	root, ok := byName["root-file.magnet"]
-	if !ok {
-		t.Fatalf("root file missing from response: %v", resp.BlackholeFiles)
-	}
-	if root.Arr != "" {
-		t.Fatalf("root file Arr = %q, want empty", root.Arr)
-	}
-	sub, ok := byName["episode.magnet"]
-	if !ok {
-		t.Fatalf("subfolder file missing from response: %v", resp.BlackholeFiles)
-	}
-	if sub.Arr != "sonarr" {
-		t.Fatalf("subfolder file Arr = %q, want sonarr", sub.Arr)
+			s := &WebServerService{
+				directoryWatcherService: &dw,
+				config: &config.Config{
+					BlackholeDirectory:  bh,
+					EnableArrSubfolders: tt.enabled,
+					Arrs:                []config.ArrConfig{{Name: "sonarr"}},
+				},
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/api/blackhole", nil)
+			rec := httptest.NewRecorder()
+			s.BlackholeHandler(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("BlackholeHandler status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+			}
+
+			var resp BlackholeResponse
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("decoding response: %v", err)
+			}
+			if resp.Status == "Not Initialized" {
+				t.Fatal("BlackholeHandler reported Not Initialized for an initialized watcher")
+			}
+			if len(resp.BlackholeFiles) != 1 {
+				t.Fatalf("BlackholeFiles = %v, want 1 entry", resp.BlackholeFiles)
+			}
+			if got := resp.BlackholeFiles[0].Arr; got != tt.wantArr {
+				t.Fatalf("Arr for %q = %q, want %q", filepath.Base(tt.filePath), got, tt.wantArr)
+			}
+		})
 	}
 }
 

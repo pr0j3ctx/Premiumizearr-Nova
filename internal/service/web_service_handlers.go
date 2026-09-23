@@ -96,26 +96,36 @@ func (s *WebServerService) BlackholeHandler(w http.ResponseWriter, r *http.Reque
 		resp.Status = "Not Initialized"
 	} else {
 		// The config swap lock read: the web save goroutine replaces the
-		// whole config struct in place, and BlackholeDirectory must be
-		// read under the same mutex's read lock as the swap or the loop
-		// below can observe a torn string header.
+		// whole config struct in place, and the Arr classification must
+		// derive from one consistent config state (BlackholeDirectory,
+		// EnableArrSubfolders, Arrs) read under the same mutex's read lock
+		// as the swap.
 		blackholeDir := ""
+		enabled := false
+		var arrs []config.ArrConfig
 		if mu := config.UpdateMu(); mu != nil {
 			mu.RLock()
 			blackholeDir = s.config.BlackholeDirectory
+			enabled = s.config.EnableArrSubfolders
+			arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
 			mu.RUnlock()
 		} else {
 			blackholeDir = s.config.BlackholeDirectory
+			enabled = s.config.EnableArrSubfolders
+			arrs = append([]config.ArrConfig(nil), s.config.Arrs...)
 		}
 		for i, n := range s.directoryWatcherService.Queue.GetQueue() {
 			// filepath (not path): fsnotify event names carry the platform
 			// separator (backslashes on Windows), and Clean/Dir/Base
 			// normalize both styles on both platforms.
 			name := filepath.Base(n)
-			arr := ""
-			if filepath.Dir(n) != filepath.Clean(blackholeDir) {
-				arr = filepath.Base(filepath.Dir(n))
-			}
+			// The Arr is derived with the same shared classification the
+			// upload routing uses: only a file directly inside a currently
+			// configured Arr subfolder under the current blackhole root
+			// reports an Arr. Root files, feature-off files, arbitrary
+			// subfolders, nested files, and leftovers of a previous
+			// blackhole location report an empty Arr (finding S-23).
+			arr := configuredBlackholeSlug(n, blackholeDir, enabled, arrs)
 			resp.BlackholeFiles = append(resp.BlackholeFiles, BlackholeFile{
 				ID:   i,
 				Name: name,

@@ -19,27 +19,39 @@ import (
 )
 
 func TestResolveTargetFolderID(t *testing.T) {
-	blackholeDir := "/blackhole"
-	mainFolderID := "main-folder-id"
-	arrFolders := map[string]string{
+	const mainFolderID = "main-folder-id"
+	resolvedFolders := map[string]string{
 		"sonarr": "sonarr-folder-id",
+		"radarr": "",
+	}
+	arrs := []config.ArrConfig{
+		{Name: "sonarr"},
+		{Name: "radarr"},
 	}
 
 	tests := []struct {
-		name     string
-		filePath string
-		wantID   string
-		wantOK   bool
-		wantSlug string
+		name       string
+		filePath   string
+		blackhole  string
+		arrFolders map[string]string
+		enabled    bool
+		wantID     string
+		wantOK     bool
+		wantSlug   string
 	}{
-		{"file in main folder", "/blackhole/movie.torrent", mainFolderID, true, ""},
-		{"file in resolved Arr subfolder", "/blackhole/sonarr/episode.nzb", "sonarr-folder-id", true, "sonarr"},
-		{"file in unresolved subfolder", "/blackhole/radarr/movie.magnet", "", false, "radarr"},
+		{"file in main folder", "/blackhole/movie.torrent", "/blackhole", resolvedFolders, true, mainFolderID, true, ""},
+		{"file in resolved Arr subfolder", "/blackhole/sonarr/episode.nzb", "/blackhole", resolvedFolders, true, "sonarr-folder-id", true, "sonarr"},
+		{"file in unresolved configured subfolder", "/blackhole/radarr/movie.magnet", "/blackhole", resolvedFolders, true, "", false, "radarr"},
+		{"file in unconfigured subfolder", "/blackhole/pirater/episode.nzb", "/blackhole", resolvedFolders, true, mainFolderID, true, ""},
+		{"feature off keeps main folder destination", "/blackhole/sonarr/episode.nzb", "/blackhole", resolvedFolders, false, mainFolderID, true, ""},
+		{"nested subfolder keeps main folder destination", "/blackhole/sonarr/season1/episode.nzb", "/blackhole", resolvedFolders, true, mainFolderID, true, ""},
+		{"leftover of previous blackhole keeps main folder destination", "/oldblackhole/sonarr/episode.nzb", "/blackhole", resolvedFolders, true, mainFolderID, true, ""},
+		{"empty blackhole directory reports no Arr", "/sonarr/episode.nzb", "", resolvedFolders, true, mainFolderID, true, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id, ok, slug := resolveTargetFolderID(tt.filePath, blackholeDir, mainFolderID, arrFolders)
+			id, ok, slug := resolveTargetFolderID(tt.filePath, tt.blackhole, mainFolderID, tt.arrFolders, tt.enabled, arrs)
 			if id != tt.wantID || ok != tt.wantOK || slug != tt.wantSlug {
 				t.Fatalf("resolveTargetFolderID(%q) = (%q, %v, %q), want (%q, %v, %q)",
 					tt.filePath, id, ok, slug, tt.wantID, tt.wantOK, tt.wantSlug)

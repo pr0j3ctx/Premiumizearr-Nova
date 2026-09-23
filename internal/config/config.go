@@ -53,6 +53,14 @@ func LoadOrCreateConfig(altConfigLocation string, _appCallback AppCallback) (Con
 			log.Errorf("Invalid Arrs configuration: %s. EnableArrSubfolders requires every Arr Name to be a lowercase slug (letters, digits, hyphens only) since it is used as the subfolder name. Fix the Arr names in config.yaml and restart, or set EnableArrSubfolders back to false.", err)
 			return config, ErrInvalidArrConfig
 		}
+		// An empty blackhole directory is unusable for per-Arr subfolders:
+		// local folders and uploads would resolve to relative paths
+		// (findings S-19/S-29). Docker installs were backfilled above, so
+		// this only triggers for an explicit local config.
+		if config.BlackholeDirectory == "" {
+			log.Errorf("Invalid config: %s. Set BlackholeDirectory in config.yaml and restart, or set EnableArrSubfolders back to false.", ErrEmptyBlackholeDirectory)
+			return config, ErrEmptyBlackholeDirectory
+		}
 	}
 
 	config.Save()

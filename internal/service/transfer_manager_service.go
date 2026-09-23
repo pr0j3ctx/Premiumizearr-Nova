@@ -263,11 +263,14 @@ func (manager *TransferManagerService) resolveArrFolders() {
 		local := filepath.Join(downloadsDir, arr.Name)
 		if err := os.MkdirAll(local, os.ModePerm); err != nil {
 			log.Errorf("Cannot create downloads subfolder for Arr %s: %s", arr.Name, err)
-			// The slug stays tracked (empty ID) instead of being dropped:
-			// dropping it would re-expose its pme folder to the root scan,
-			// while the download path recreates missing parents itself and
-			// the next resolution run retries the MkdirAll.
-			newFolders[arr.Name] = ""
+			// Keep the resolved pme ID (finding S-4): a local filesystem
+			// hiccup must not discard a successful premiumize.me
+			// resolution - overwriting it with "" would make the per-slug
+			// pass skip the slug forever and the slug would never be
+			// processed again. The slug stays tracked with its real ID:
+			// excluded from the root scan as before, the download path
+			// recreates missing parents itself, and the next poll retries
+			// the MkdirAll.
 			continue
 		}
 	}
@@ -275,6 +278,118 @@ func (manager *TransferManagerService) resolveArrFolders() {
 	manager.arrFoldersMutex.Lock()
 	manager.arrFolders = newFolders
 	manager.arrFoldersMutex.Unlock()
+}
+
+// retryUnresolvedArrFolders heals tracked Arr slugs whose pme folder is
+// still unresolved (empty ID) after a failed resolution run - a transient
+// premiumize.me failure or a failed local MkdirAll (finding S-22). A slug
+// is retried during the normal poll only while it is still a configured
+// Arr; a slug that was renamed away or removed stays tracked with its
+// empty ID (excluded from the root scan) and is never re-resolved, because
+// re-creating the pme folder for a name the user no longer configures
+// would resurrect a folder the user abandoned. Any failure keeps the empty
+// ID so the next poll retries.
+func (manager *TransferManagerService) retryUnresolvedArrFolders() {
+	// Snapshot the config fields under the config swap read lock: the web
+	// goroutine replaces the whole config struct in place.
+	enabled := false
+	var arrs []config.ArrConfig
+	downloadsDir := ""
+	if mu := config.UpdateMu(); mu != nil {
+		mu.RLock()
+		enabled = manager.config.EnableArrSubfolders
+		arrs = append([]config.ArrConfig(nil), manager.config.Arrs...)
+		downloadsDir = manager.config.DownloadsDirectory
+		mu.RUnlock()
+	} else {
+		enabled = manager.config.EnableArrSubfolders
+		arrs = append([]config.ArrConfig(nil), manager.config.Arrs...)
+		downloadsDir = manager.config.DownloadsDirectory
+	}
+	if !enabled {
+		return
+	}
+
+	manager.arrFoldersMutex.Lock()
+	mainFolderID := manager.downloadsFolderID
+	if mainFolderID == "" {
+		manager.arrFoldersMutex.Unlock()
+		return
+	}
+	var unresolved []string
+	for slug, folderID := range manager.arrFolders {
+		if folderID != "" {
+			continue
+		}
+		configured := false
+		for _, arr := range arrs {
+			if arr.Name == slug {
+				configured = true
+				break
+			}
+		}
+		if configured {
+			unresolved = append(unresolved, slug)
+		}
+	}
+	manager.arrFoldersMutex.Unlock()
+
+	for _, slug := range unresolved {
+		id, err := utils.GetOrCreateSubfolderID(manager.premiumizemeClient, mainFolderID, slug)
+		if err != nil {
+			log.Errorf("Retrying premiumize.me subfolder for Arr %s failed, retrying on next poll: %s", slug, err)
+			continue
+		}
+		local := filepath.Join(downloadsDir, slug)
+		if err := os.MkdirAll(local, os.ModePerm); err != nil {
+			log.Errorf("Retrying downloads subfolder for Arr %s failed, retrying on next poll: %s", slug, err)
+			continue
+		}
+
+		// Re-validate under the config swap read lock after the pme round
+		// trip: the feature may have been toggled off or the slug renamed
+		// away in the meantime - in both cases the slug must not be
+		// upgraded, it stays tracked (and excluded) with its empty ID.
+		stillEnabled := false
+		stillConfigured := false
+		if mu := config.UpdateMu(); mu != nil {
+			mu.RLock()
+			stillEnabled = manager.config.EnableArrSubfolders
+			for _, arr := range manager.config.Arrs {
+				if arr.Name == slug {
+					stillConfigured = true
+					break
+				}
+			}
+			mu.RUnlock()
+		} else {
+			stillEnabled = manager.config.EnableArrSubfolders
+			for _, arr := range manager.config.Arrs {
+				if arr.Name == slug {
+					stillConfigured = true
+					break
+				}
+			}
+		}
+		if !stillEnabled || !stillConfigured {
+			continue
+		}
+
+		manager.arrFoldersMutex.Lock()
+		// The main folder may have changed while the pme call was in
+		// flight (transfer directory switch): a folder created under the
+		// old parent does not belong to the new state.
+		if manager.downloadsFolderID != mainFolderID {
+			manager.arrFoldersMutex.Unlock()
+			continue
+		}
+		// Upgrade only from an empty ID: a concurrent resolution that
+		// already resolved the slug keeps its result.
+		if current, ok := manager.arrFolders[slug]; ok && current == "" {
+			manager.arrFolders[slug] = id
+		}
+		manager.arrFoldersMutex.Unlock()
+	}
 }
 
 func (manager *TransferManagerService) Run(interval time.Duration) {
@@ -706,6 +821,12 @@ func (manager *TransferManagerService) TaskCheckPremiumizeDownloadsFolder() {
 		log.Errorf("Premiumize-Download-Folder ID is empty, cannot check Folder - aborting (This could be due to a Premiumize or CDN Outage)")
 		return
 	}
+
+	// Heal tracked slugs whose pme folder is still unresolved before the
+	// exclusion layers are snapshotted: a slug healed here is excluded by
+	// ID and processed by the per-slug pass below in this same poll
+	// (finding S-22).
+	manager.retryUnresolvedArrFolders()
 
 	// The exclusion layers apply when the feature is on - or when it was
 	// on at some point for this manager: the tracked map still holds the

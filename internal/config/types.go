@@ -7,10 +7,11 @@ import (
 )
 
 var (
-	ErrInvalidConfigFile      = errors.New("invalid Config File")
-	ErrFailedToFindConfigFile = errors.New("failed to find config file")
-	ErrFailedToSaveConfig     = errors.New("failed to save config")
-	ErrInvalidArrConfig       = errors.New("invalid arr config")
+	ErrInvalidConfigFile       = errors.New("invalid Config File")
+	ErrFailedToFindConfigFile  = errors.New("failed to find config file")
+	ErrFailedToSaveConfig      = errors.New("failed to save config")
+	ErrInvalidArrConfig        = errors.New("invalid arr config")
+	ErrEmptyBlackholeDirectory = errors.New("invalid config: EnableArrSubfolders requires a non-empty BlackholeDirectory")
 )
 
 // ArrType enum for Sonarr/Radarr/Lidarr

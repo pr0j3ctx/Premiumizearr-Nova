@@ -68,24 +68,31 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 
 	if blackholeChanged {
 		log.Info("Blackhole directory changed, restarting directory watcher...")
-		log.Info("Running initial directory scan...")
+		// Apply the LIVE committed blackhole directory, not this
+		// callback's argument snapshot: the reconfiguration worker serializes
+		// callbacks, but a newer save may have committed while this one was
+		// still queued. Re-applying the argument value would move the watcher
+		// and the subfolder watches below back to the stale location, on top
+		// of the newer commit (finding S-28).
 		dw.mu.RLock()
 		blackholeDir := dw.config.BlackholeDirectory
 		dw.mu.RUnlock()
+		log.Info("Running initial directory scan...")
 		go dw.directoryScan(blackholeDir)
 
-		// The watcher handle is read and written under dw.mu: this web
+		// The watcher handle is read and written under dw.mu: this
 		// goroutine and the Start() goroutine may both replace it.
 		dw.mu.RLock()
 		wd := dw.watchDirectory
 		dw.mu.RUnlock()
+		created := false
 		if wd == nil {
 			// The startup watcher never came up (Watch failed at Start):
 			// UpdatePath needs a live watcher, so try a fresh Watch on the
 			// new path instead of leaving watch mode dead for the process
 			// lifetime.
 			log.Info("Watcher unavailable, (re)starting the directory watcher...")
-			wd = directory_watcher.NewDirectoryWatcher(newConfig.BlackholeDirectory,
+			wd = directory_watcher.NewDirectoryWatcher(blackholeDir,
 				true,
 				dw.checkFile,
 				dw.addFileToQueue,
@@ -93,20 +100,28 @@ func (dw *DirectoryWatcherService) ConfigUpdatedCallback(currentConfig config.Co
 			if err := wd.Watch(); err != nil {
 				// A failed Watch already created the fsnotify instance and
 				// its event-loop goroutine: stop it so the partial watcher
-				// does not leak.
+				// does not leak. The nil handle stays in place so a later
+				// config change re-attempts Watch (failed-startup recovery).
 				wd.Stop()
 				log.Errorf("Error (re)starting directory watcher: %s", err)
 			} else {
 				dw.mu.Lock()
 				dw.watchDirectory = wd
 				dw.mu.Unlock()
+				created = true
 			}
 		}
 		if wd != nil {
-			wd.UpdatePath(newConfig.BlackholeDirectory)
+			// A freshly created watcher already watches the live directory;
+			// only move an existing one, and move it to the live directory.
+			if !created {
+				wd.UpdatePath(blackholeDir)
+			}
 
-			// Snapshot the keys under the lock: the map must not be
-			// iterated while resolveSingleArrFolder writes to it.
+			// The old subfolder watches live at the PRE-update blackhole
+			// location (the argument snapshot); they must be removed from
+			// there, while the re-watches added by resolveArrFolders below
+			// use the live one.
 			dw.mu.RLock()
 			slugs := make([]string, 0, len(dw.arrFolders))
 			for slug := range dw.arrFolders {
@@ -193,8 +208,11 @@ func (dw *DirectoryWatcherService) Start() {
 				directory := dw.config.BlackholeDirectory
 				dw.mu.RUnlock()
 				log.Infof("Running directory scan of %s", directory)
+				// The root scan alone covers the Arr subfolders: checkFile
+				// fans a scan out into each configured subfolder it meets,
+				// so a separate per-subfolder scan pass here would just
+				// re-scan the same directories (finding S-2).
 				dw.directoryScan(directory)
-				dw.scanArrFolders()
 				log.Infof("Scan complete, next scan in %d minutes", interval)
 			}
 		}()
@@ -236,6 +254,18 @@ func (dw *DirectoryWatcherService) Start() {
 			dw.mu.Unlock()
 			if previous != nil && previous != oldWatcher {
 				previous.Stop()
+			}
+			// Re-read the live blackhole directory after the assignment: the
+			// re-read above ran before Watch(), so a save committed in the
+			// window between it and the assignment applies the newest value
+			// instead of the stale one the watcher was created with
+			// (finding S-28).
+			dw.mu.RLock()
+			liveBlackholeDir := dw.config.BlackholeDirectory
+			dw.mu.RUnlock()
+			if liveBlackholeDir != blackholeDir {
+				log.Infof("Blackhole directory changed to %s while starting the watcher, updating the watch", liveBlackholeDir)
+				wd.UpdatePath(liveBlackholeDir)
 			}
 		}
 	}
@@ -289,6 +319,15 @@ func (dw *DirectoryWatcherService) resolveArrFolders() {
 
 	if !enabled {
 		dw.clearArrFolders(blackholeDir)
+		return
+	}
+
+	// The startup path and the config API reject an empty blackhole
+	// directory (findings S-19/S-29); if one still ends up here, the local
+	// subfolders would resolve to relative paths, so keep the current map
+	// and skip instead of acting on it.
+	if blackholeDir == "" {
+		log.Warn("Blackhole directory is not configured, skipping per-Arr subfolder resolution")
 		return
 	}
 
@@ -389,27 +428,6 @@ func (dw *DirectoryWatcherService) watchArrFolder(local string) {
 	}
 	if err := wd.AddWatchPath(local); err != nil {
 		log.Errorf("Cannot watch blackhole subfolder %s: %s", local, err)
-	}
-}
-
-func (dw *DirectoryWatcherService) scanArrFolders() {
-	dw.mu.RLock()
-	enabled := dw.config.EnableArrSubfolders
-	blackholeDir := dw.config.BlackholeDirectory
-	arrs := make([]config.ArrConfig, len(dw.config.Arrs))
-	copy(arrs, dw.config.Arrs)
-	dw.mu.RUnlock()
-
-	if !enabled {
-		return
-	}
-
-	for _, arr := range arrs {
-		local := filepath.Join(blackholeDir, arr.Name)
-		if _, err := os.Stat(local); err != nil {
-			continue
-		}
-		dw.directoryScan(local)
 	}
 }
 
@@ -535,25 +553,58 @@ func (dw *DirectoryWatcherService) resolveSingleArrFolder(slug string, mainFolde
 	return id, true
 }
 
-func resolveTargetFolderID(filePath, blackholeDir, mainFolderID string, arrFolders map[string]string) (folderID string, ok bool, slug string) {
+// configuredBlackholeSlug returns the Arr slug for a file that lies
+// DIRECTLY inside a currently configured Arr subfolder of the given
+// blackhole directory, or "" when no such slug applies: the file is in the
+// blackhole root itself, in a subfolder that is not a configured Arr slug
+// (feature off, arbitrary name, or a leftover of a previous blackhole
+// location), or nested deeper than one level below the root. Upload routing
+// and the web queue view share it so they never disagree about which file
+// belongs to which Arr (finding S-23).
+func configuredBlackholeSlug(filePath, blackholeDir string, enabled bool, arrs []config.ArrConfig) string {
+	if !enabled {
+		return ""
+	}
 	dir := filepath.Clean(filepath.Dir(filePath))
 	cleanBlackhole := filepath.Clean(blackholeDir)
 	if dir == cleanBlackhole {
-		// An unresolved main folder must not be reported as a valid
-		// target: an empty folder ID would submit the file to the account
-		// root instead of the transfers directory.
-		return mainFolderID, mainFolderID != "", ""
+		return ""
 	}
-	// A file whose parent is not the current blackhole and not a direct
-	// subfolder of it (a leftover of a previous blackhole location) goes to
-	// the main downloads folder: reporting a slug for it would make
-	// processUpload create a pme folder named after a directory the user
-	// never defined.
-	if !strings.HasPrefix(dir, cleanBlackhole+string(filepath.Separator)) {
-		return mainFolderID, mainFolderID != "", ""
+	// The parent directory must be directly inside the current blackhole.
+	// A blackhole set to the working directory has direct children that are
+	// bare directory names (no separator).
+	inside := strings.HasPrefix(dir, cleanBlackhole+string(filepath.Separator))
+	if cleanBlackhole == "." {
+		inside = !strings.ContainsRune(dir, filepath.Separator)
 	}
+	if !inside {
+		return ""
+	}
+	// Exactly one level below the root: a nested directory is not an Arr
+	// subfolder even when its own name matches a configured slug.
+	if filepath.Dir(dir) != cleanBlackhole {
+		return ""
+	}
+	slug := filepath.Base(dir)
+	for _, arr := range arrs {
+		if arr.Name == slug {
+			return slug
+		}
+	}
+	return ""
+}
 
-	slug = filepath.Base(dir)
+func resolveTargetFolderID(filePath, blackholeDir, mainFolderID string, arrFolders map[string]string, enabled bool, arrs []config.ArrConfig) (folderID string, ok bool, slug string) {
+	slug = configuredBlackholeSlug(filePath, blackholeDir, enabled, arrs)
+	if slug == "" {
+		// A file in the blackhole root, in a subfolder that is not a
+		// configured Arr slug, or outside the current blackhole keeps the
+		// pre-feature destination: an empty folder ID would submit the file
+		// to the account root, and a slug here would make processUpload
+		// create a pme folder named after a directory the user never
+		// defined.
+		return mainFolderID, mainFolderID != "", ""
+	}
 	id, found := arrFolders[slug]
 	// An empty ID (an unresolved slug) is not a routable target: the
 	// caller resolves it on demand and retries.
@@ -653,7 +704,9 @@ func (dw *DirectoryWatcherService) submissionsAllowed() bool {
 func (dw *DirectoryWatcherService) processUpload(filePath string) bool {
 	log.Debugf("Processing %s", filePath)
 	dw.mu.RLock()
-	folderID, ok, slug := resolveTargetFolderID(filePath, dw.config.BlackholeDirectory, dw.downloadsFolderID, dw.arrFolders)
+	// All three fields are read under the same read lock as the swap:
+	// the slug classification must come from one consistent config state.
+	folderID, ok, slug := resolveTargetFolderID(filePath, dw.config.BlackholeDirectory, dw.downloadsFolderID, dw.arrFolders, dw.config.EnableArrSubfolders, dw.config.Arrs)
 	mainFolderID := dw.downloadsFolderID
 	dw.mu.RUnlock()
 	if !ok && slug != "" {

@@ -197,7 +197,9 @@ func TestManagerRetryDoesNotUpgradeSlugWhenConfigChangesInFlight(t *testing.T) {
 
 		// The round trip ran to completion (its pme folder was created
 		// under the old parent) - the test is not passing vacuously.
-		if !srv.anyCall(func(c pmeCall) bool { return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id" }) {
+		if !srv.anyCall(func(c pmeCall) bool {
+			return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id"
+		}) {
 			t.Fatalf("the round trip did not create the pme folder: calls = %v", srv.callsSnapshot())
 		}
 
@@ -230,7 +232,9 @@ func TestManagerRetryDoesNotUpgradeSlugWhenConfigChangesInFlight(t *testing.T) {
 		}
 		config.WaitReconfigIdle()
 
-		if !srv.anyCall(func(c pmeCall) bool { return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id" }) {
+		if !srv.anyCall(func(c pmeCall) bool {
+			return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id"
+		}) {
 			t.Fatalf("the round trip did not create the pme folder: calls = %v", srv.callsSnapshot())
 		}
 
@@ -282,7 +286,9 @@ func TestManagerRetryDoesNotAdoptFolderFromStaleParentAfterTransferDirectorySwit
 
 	// The round trip ran to completion against the OLD parent - the test
 	// is not passing vacuously.
-	if !srv.anyCall(func(c pmeCall) bool { return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id" }) {
+	if !srv.anyCall(func(c pmeCall) bool {
+		return c.Path == "/api/folder/create" && c.Query["name"] == "sonarr" && c.Query["parent_id"] == "main-id"
+	}) {
 		t.Fatalf("the round trip did not create the pme folder under the old parent: calls = %v", srv.callsSnapshot())
 	}
 
